@@ -1,0 +1,7 @@
+Getting started with the Dropbox python library:
+1. python setup.py install
+2. Copy config/testing.ini.example to config/testing.ini
+3. In config/testing.ini enter your application's consumer key, secret key,
+   and your test user email and password.
+4. Run 'nosetests tests' to make sure all the tests pass.
+5. Start developing your Dropbox API application!
