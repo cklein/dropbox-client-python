@@ -1,277 +1,608 @@
 """
-The main client API you'll be working with most often.  You'll need to 
-configure a dropbox.client.Authenticator for this to work, but otherwise
+The main client API you'll be working with most often.  You'll need to
+configure a dropbox.session.DropboxSession for this to work, but otherwise
 it's fairly self-explanatory.
 """
 
-from dropbox import rest
-import urllib
-import urllib2
-import poster
-import httplib
+import re
+import json
 
-API_VERSION=0
-HASH_BLOCK_SIZE=10*1024
+from dropbox.rest import ErrorResponse
+from dropbox.rest import RESTClient
+
+def format_path(path):
+    """Normalize path for use with the Dropbox API.
+
+    This function turns multiple adjacent slashes into single
+    slashes, then ensures that there's a leading slash but
+    not a trailing slash.
+    """
+    if not path:
+        return path
+
+    path = re.sub(r'/+', '/', path)
+
+    if path == '/':
+        return ""
+    else:
+        return '/' + path.strip('/')
 
 class DropboxClient(object):
     """
-    The main access point of doing REST calls on Dropbox.  You use it
-    by first creating and configuring a dropbox.auth.Authenticator,
-    and then configuring a DropboxClient to talk to the service.  The
-    DropboxClient then does all the work of properly calling each API
+    The main access point of doing REST calls on Dropbox. You should
+    first create and configure a dropbox.session.DropboxSession object,
+    and then pass it into DropboxClient's constructor. DropboxClient
+    then does all the work of properly calling each API method
     with the correct OAuth authentication.
+
+    You should be aware that any of these methods can raise a
+    rest.ErrorResponse exception if the server returns a non-200
+    or invalid HTTP response. Note that a 401 return status at any
+    point indicates that the user needs to be reauthenticated.
     """
-    
 
-    def __init__(self, api_host, content_host, port, auth, token):
-        """
-        The api_host and content_host are normally 'api.dropbox.com' and
-        'api-content.dropbox.com' and will use the same port.
-        The auth is a dropbox.client.Authenticator that is properly configured.
-        The token is a valid OAuth `access token` that you got using 
-        dropbox.client.Authenticator.obtain_access_token.
-        """
-        self.api_rest = rest.RESTClient(api_host, port)
-        self.content_rest = rest.RESTClient(content_host, port)
-        self.auth = auth
-        self.token = token
-        self.api_host = api_host
-        self.content_host = content_host
-        self.api_host = api_host
-        self.port = int(port)
+    def __init__(self, session):
+        """Initialize the DropboxClient object.
 
-
-    def request(self, host, method, target, params, callback):
+        Args:
+            session: A dropbox.session.DropboxSession object to use for making requests.
         """
+        self.session = session
+
+    def request(self, target, params=None, method='POST', content_server=False):
+        """Make an HTTP request to a target API method.
+
         This is an internal method used to properly craft the url, headers, and
         params for a Dropbox API request.  It is exposed for you in case you
-        need craft other API calls not in this library or you want to debug it.
+        need craft other API calls not in this library or if you want to debug it.
 
-        It is only expected to work for GET or POST parameters.
+        Args:
+            target: The target URL with leading slash (e.g. '/files')
+            params: A dictionary of parameters to add to the request
+            method: An HTTP method (e.g. 'GET' or 'POST')
+            content_server: A boolean indicating whether the request is to the
+               API content server, for example to fetch the contents of a file
+               rather than its metadata.
+
+        Returns:
+            A tuple of (url, params, headers) that should be used to make the request.
+            OAuth authentication information will be added as needed within these fields.
         """
-        assert method in ['GET','POST'], "Only 'GET' and 'POST' are allowed for method."
+        assert method in ['GET','POST', 'PUT'], "Only 'GET', 'POST', and 'PUT' are allowed."
+        if params is None:
+            params = {}
 
-        base = self.build_full_url(host, target)
-        headers, params = self.auth.build_access_headers(method, self.token, base, params, callback)
+        host = self.session.API_CONTENT_HOST if content_server else self.session.API_HOST
+        base = self.session.build_url(host, target)
+        headers, params = self.session.build_access_headers(method, base, params)
 
-        if method == "GET":
-            url = self.build_url(target, params)
+        if method in ('GET', 'PUT'):
+            url = self.session.build_url(host, target, params)
         else:
-            url = self.build_url(target)
+            url = self.session.build_url(host, target)
 
-        return url, headers, params
+        return url, params, headers
 
 
-    def account_info(self, status_in_response=False, callback=None):
+    def account_info(self):
+        """Retrieve information about the user's account.
+
+        Returns:
+            A dictionary containing account information.
+
+            For a detailed description of what this call returns, visit:
+            https://www.dropbox.com/developers/docs#account-info
         """
-        Retrieve information about the user's account.
+        url, params, headers = self.request("/account/info", method='GET')
 
-        * callback. Optional. The server will wrap its response of format inside a call to the argument specified by callback. Value must contains only alphanumeric characters and underscores.
-        * status_in_response. Optional. Some clients (e.g., Flash) cannot handle HTTP status codes well. If this parameter is set to true, the service will always return a 200 status and report the relevant status code via additional information in the response body. Default is false.
+        return RESTClient.GET(url, headers)
+
+
+    def put_file(self, full_path, file_obj, overwrite=False, parent_rev=None):
+        """Upload a file.
+
+        Args:
+            full_path: The full path to upload the file to, *including the file name*.
+                If the destination directory does not yet exist, it will be created.
+            file_obj: A file-like object to upload. If you would like, you can pass a string as file_obj.
+            overwrite: Whether to overwrite an existing file at the given path. [default False]
+                If overwrite is False and a file already exists there, Dropbox
+                will rename the upload to make sure it doesn't overwrite anything.
+                You need to check the metadata returned for the new name.
+                This field should only be True if your intent is to potentially
+                clobber changes to a file that you don't know about.
+            parent_rev: The rev field from the 'parent' of this upload. [optional]
+                If your intent is to update the file at the given path, you should
+                pass the parent_rev parameter set to the rev value from the most recent
+                metadata you have of the existing file at that path. If the server
+                has a more recent version of the file at the specified path, it will
+                automatically rename your uploaded file, spinning off a conflict.
+                Using this parameter effectively causes the overwrite parameter to be ignored.
+                The file will always be overwritten if you send the most-recent parent_rev,
+                and it will never be overwritten if you send a less-recent one.
+
+        Returns:
+            A dictionary containing the metadata of the newly uploaded file.
+
+            For a detailed description of what this call returns, visit:
+            https://www.dropbox.com/developers/docs#files-put
+
+        Raises:
+            A dropbox.rest.ErrorResponse with an HTTP status of
+               400: Bad request (may be due to many things; check e.error for details)
+               503: User over quota
+
+        Note: In Python versions below version 2.6, httplib doesn't handle file-like objects.
+            In that case, this code will read the entire file into memory (!).
         """
-        
-        params = {'status_in_response': status_in_response}
+        path = "/files_put/%s%s" % (self.session.root, format_path(full_path))
 
-        url, headers, params = self.request(self.api_host, "GET", "/account/info", params, callback)
+        params = {
+            'overwrite': bool(overwrite),
+            }
 
-        return self.api_rest.GET(url, headers)
+        if parent_rev is not None:
+            params['parent_rev'] = parent_rev
 
+        url, params, headers = self.request(path, params, method='PUT', content_server=True)
 
-    def put_file(self, root, to_path, file_obj):
+        return RESTClient.PUT(url, file_obj.read(), headers)
+
+    def get_file(self, from_path, rev=None):
+        """Download a file.
+
+        Unlike most other calls, get_file returns a raw HTTPResponse with the connection open.
+        You should call .read() and perform any processing you need, then close the HTTPResponse.
+
+        Args:
+            from_path: The path to the file to be downloaded.
+            rev: A previous rev value of the file to be downloaded. [optional]
+
+        Returns:
+            An httplib.HTTPResponse that is the result of the request.
+
+        Raises:
+            A dropbox.rest.ErrorResponse with an HTTP status of
+               400: Bad request (may be due to many things; check e.error for details)
+               404: No file was found at the given path, or the file that was there was deleted.
+               200: Request was okay but response was malformed in some way.
         """
-        Retrieve or upload file contents relative to the user's Dropbox root or
-        the application's sandbox directory within the user's Dropbox.
+        path = "/files/%s%s" % (self.session.root, format_path(from_path))
 
-        * root is one of "dropbox" or "sandbox", most clients will use "sandbox".
-        * to_path is the `directory` path to put the file (NOT the full path).
-        * file_obj is an open and ready to read file object that will be uploaded.
+        params = {}
+        if rev is not None:
+            params['rev'] = rev
 
-        The filename is taken from the file_obj name currently, so you can't
-        have the local file named differently than it's target name.  This may
-        change in future versions.
+        url, params, headers = self.request(path, params, method='GET', content_server=True)
+        return RESTClient.request("GET", url, headers=headers, raw_response=True)
 
-        Finally, this function is not terribly efficient due to Python's
-        HTTPConnection requiring all of the file be read into ram for the POST.
-        Future versions will avoid this problem.
+    def get_file_and_metadata(self, from_path, rev=None):
+        """Download a file alongwith its metadata.
+
+        Acts as a thin wrapper around get_file() (see get_file() comments for
+        more details)
+
+        Args:
+            from_path: The path to the file to be downloaded.
+            rev: A previous rev value of the file to be downloaded. [optional]
+
+        Returns:
+            - An httplib.HTTPResponse that is the result of the request.
+            - A dictionary containing the metadata of the file (see
+              https://www.dropbox.com/developers/docs#metadata for details).
+
+        Raises:
+            A dropbox.rest.ErrorResponse with an HTTP status of
+               400: Bad request (may be due to many things; check e.error for details)
+               404: No file was found at the given path, or the file that was there was deleted.
+               200: Request was okay but response was malformed in some way.
         """
-        assert root in ["dropbox", "sandbox"]
+        file_res = self.get_file(from_path, rev)
+        metadata = DropboxClient.__parse_metadata_as_dict(file_res)
 
-        path = "/files/%s%s" % (root, to_path)
+        return file_res, metadata
 
-        params = { "file" : file_obj.name, }
-
-        url, headers, params = self.request(self.content_host, "POST", path, params, None)
-
-        params['file'] = file_obj
-        data, mp_headers = poster.encode.multipart_encode(params)
-        if 'Content-Length' in mp_headers:
-            mp_headers['Content-Length'] = str(mp_headers['Content-Length'])
-        headers.update(mp_headers)
-
-        conn = httplib.HTTPConnection(self.content_host, self.port)
-        conn.request("POST", url, "".join(data), headers)
-
-        resp = rest.RESTResponse(conn.getresponse())
-        conn.close()
-        file_obj.close()
-
-        return resp
-        
-
-    def get_file(self, root, from_path):
+    @staticmethod
+    def __parse_metadata_as_dict((status, headers, response)):
+        """Parses file metadata from a raw dropbox HTTP response, raising a
+        dropbox.rest.ErrorResponse if parsing fails.
         """
-        Retrieves a file from the given root ("dropbox" or "sandbox") based on
-        from_path as the `full path` to the file.  Unlike the other calls, this
-        one returns a raw HTTPResponse with the connection open.  You should 
-        do your read and any processing you need and then close it.
+        metadata = None
+        for header, header_val in headers.items():
+            if header.lower() == 'x-dropbox-metadata':
+                try:
+                    metadata = json.loads(header_val)
+                except ValueError:
+                    raise ErrorResponse(status, headers, response)
+        if not metadata:
+            raise ErrorResponse(status, headers, response)
+        return metadata
+
+    def file_copy(self, from_path, to_path):
+        """Copy a file or folder to a new location.
+
+        Args:
+            from_path: The path to the file or folder to be copied.
+
+            to_path: The destination path of the file or folder to be copied.
+                This parameter should include the destination filename (e.g.
+                from_path: '/test.txt', to_path: '/dir/test.txt'). If there's
+                already a file at the to_path, this copy will be renamed to
+                be unique.
+
+        Returns:
+            A dictionary containing the metadata of the new copy of the file or folder.
+
+            For a detailed description of what this call returns, visit:
+            https://www.dropbox.com/developers/docs#fileops-copy
+
+        Raises:
+            A dropbox.rest.ErrorResponse with an HTTP status of:
+
+            - 400: Bad request (may be due to many things; check e.error for details)
+            - 404: No file was found at given from_path.
+            - 503: User over storage quota.
         """
-        assert root in ["dropbox", "sandbox"]
-        
-        path = "/files/%s%s" % (root, from_path)
+        params = {'root': self.session.root,
+                  'from_path': format_path(from_path),
+                  'to_path': format_path(to_path),
+                  }
 
-        url, headers, params = self.request(self.content_host, "GET", path, {}, None)
-        return self.content_rest.request("GET", url, headers=headers, raw_response=True)
+        url, params, headers = self.request("/fileops/copy", params)
+
+        return RESTClient.POST(url, params, headers)
 
 
-    def file_copy(self, root, from_path, to_path, callback=None):
+    def file_create_folder(self, path):
+        """Create a folder.
+
+        Args:
+            path: The path of the new folder.
+
+        Returns:
+            A dictionary containing the metadata of the newly created folder.
+
+            For a detailed description of what this call returns, visit:
+            https://www.dropbox.com/developers/docs#fileops-create-folder
+
+        Raises:
+            A dropbox.rest.ErrorResponse with an HTTP status of
+               400: Bad request (may be due to many things; check e.error for details)
+               403: A folder at that path already exists.
         """
-        Copy a file or folder to a new location.
+        params = {'root': self.session.root, 'path': format_path(path)}
 
-        * callback. Optional. The server will wrap its response of format inside a call to the argument specified by callback. Value must contains only alphanumeric characters and underscores.
-        * from_path. Required. from_path specifies either a file or folder to be copied to the location specified by to_path. This path is interpreted relative to the location specified by root.
-        * root. Required. Specify the root relative to which from_path and to_path are specified. Valid values are dropbox and sandbox.
-        * to_path. Required. to_path specifies the destination path including the new name for file or folder. This path is interpreted relative to the location specified by root.
+        url, params, headers = self.request("/fileops/create_folder", params)
+
+        return RESTClient.POST(url, params, headers)
+
+
+    def file_delete(self, path):
+        """Delete a file or folder.
+
+        Args:
+            path: The path of the file or folder.
+
+        Returns:
+            A dictionary containing the metadata of the just deleted file.
+
+            For a detailed description of what this call returns, visit:
+            https://www.dropbox.com/developers/docs#fileops-delete
+
+        Raises:
+            A dropbox.rest.ErrorResponse with an HTTP status of
+
+            - 400: Bad request (may be due to many things; check e.error for details)
+            - 404: No file was found at the given path.
         """
-        assert root in ["dropbox", "sandbox"]
+        params = {'root': self.session.root, 'path': format_path(path)}
 
-        params = {'root': root, 'from_path': from_path, 'to_path': to_path}
+        url, params, headers = self.request("/fileops/delete", params)
 
-        url, headers, params = self.request(self.api_host, "POST", "/fileops/copy", params, callback)
-
-        return self.api_rest.POST(url, params, headers)
+        return RESTClient.POST(url, params, headers)
 
 
-    def file_create_folder(self, root, path, callback=None):
+    def file_move(self, from_path, to_path):
+        """Move a file or folder to a new location.
+
+        Args:
+            from_path: The path to the file or folder to be moved.
+            to_path: The destination path of the file or folder to be moved.
+            This parameter should include the destination filename (e.g.
+            from_path: '/test.txt', to_path: '/dir/test.txt'). If there's
+            already a file at the to_path, this file or folder will be renamed to
+            be unique.
+
+        Returns:
+            A dictionary containing the metadata of the new copy of the file or folder.
+
+            For a detailed description of what this call returns, visit:
+            https://www.dropbox.com/developers/docs#fileops-move
+
+        Raises:
+            A dropbox.rest.ErrorResponse with an HTTP status of
+
+            - 400: Bad request (may be due to many things; check e.error for details)
+            - 404: No file was found at given from_path.
+            - 503: User over storage quota.
         """
-        Create a folder relative to the user's Dropbox root or the user's application sandbox folder.
+        params = {'root': self.session.root, 'from_path': format_path(from_path), 'to_path': format_path(to_path)}
 
-        * callback. Optional. The server will wrap its response of format inside a call to the argument specified by callback. Value must contains only alphanumeric characters and underscores.
-        * path. Required. The path to the new folder to create, relative to root.
-        * root. Required. Specify the root relative to which path is specified. Valid values are dropbox and sandbox.
+        url, params, headers = self.request("/fileops/move", params)
+
+        return RESTClient.POST(url, params, headers)
+
+
+    def metadata(self, path, list=True, file_limit=10000, hash=None, rev=None, include_deleted=False):
+        """Retrieve metadata for a file or folder.
+
+        Args:
+            path: The path to the file or folder.
+
+            list: Whether to list all contained files (only applies when
+                path refers to a folder).
+            file_limit: The maximum number of file entries to return within
+                a folder. If the number of files in the directory exceeds this
+                limit, an exception is raised. The server will return at max
+                10,000 files within a folder.
+            hash: Every directory listing has a hash parameter attached that
+                can then be passed back into this function later to save on\
+                bandwidth. Rather than returning an unchanged folder's contents,\
+                the server will instead return a 304.\
+            rev: The revision of the file to retrieve the metadata for. [optional]
+                This parameter only applies for files. If omitted, you'll receive
+                the most recent revision metadata.
+
+        Returns:
+            A dictionary containing the metadata of the file or folder
+            (and contained files if appropriate).
+
+            For a detailed description of what this call returns, visit:
+            https://www.dropbox.com/developers/docs#metadata
+
+        Raises:
+            A dropbox.rest.ErrorResponse with an HTTP status of
+
+            - 304: Current directory hash matches hash parameters, so contents are unchanged.
+            - 400: Bad request (may be due to many things; check e.error for details)
+            - 404: No file was found at given path.
+            - 406: Too many file entries to return.
         """
-        assert root in ["dropbox", "sandbox"]
-        params = {'root': root, 'path': path}
-
-        url, headers, params = self.request(self.api_host, "POST", "/fileops/create_folder", params, callback)
-
-        return self.api_rest.POST(url, params, headers)
-
-
-    def file_delete(self, root, path, callback=None):
-        """
-        Delete a file or folder.
-
-        * callback. Optional. The server will wrap its response of format inside a call to the argument specified by callback. Value must contains only alphanumeric characters and underscores.
-        * path. Required. path specifies either a file or folder to be deleted. This path is interpreted relative to the location specified by root.
-        * root. Required. Specify the root relative to which path is specified. Valid values are dropbox and sandbox.
-        """
-        assert root in ["dropbox", "sandbox"]
-
-        params = {'root': root, 'path': path}
-
-        url, headers, params = self.request(self.api_host, "POST", "/fileops/delete", params,
-                                           callback)
-
-        return self.api_rest.POST(url, params, headers)
-
-
-    def file_move(self, root, from_path, to_path, callback=None):
-        """
-        Move a file or folder to a new location.
-
-        * callback. Optional. The server will wrap its response of format inside a call to the argument specified by callback. Value must contains only alphanumeric characters and underscores.
-        * from_path. Required. from_path specifies either a file or folder to be copied to the location specified by to_path. This path is interpreted relative to the location specified by root.
-        * root. Required. Specify the root relative to which from_path and to_path are specified. Valid values are dropbox and sandbox.
-        * to_path. Required. to_path specifies the destination path including the new name for file or folder. This path is interpreted relative to the location specified by root.
-        """
-        assert root in ["dropbox", "sandbox"]
-
-        params = {'root': root, 'from_path': from_path, 'to_path': to_path}
-
-        url, headers, params = self.request(self.api_host, "POST", "/fileops/move", params, callback)
-
-        return self.api_rest.POST(url, params, headers)
-
-
-    def metadata(self, root, path, file_limit=10000, hash=None, list=True, status_in_response=False, callback=None):
-        """
-        The metadata API location provides the ability to retrieve file and
-        folder metadata and manipulate the directory structure by moving or
-        deleting files and folders.
-
-        * callback. Optional. The server will wrap its response of format inside a call to the argument specified by callback. Value must contains only alphanumeric characters and underscores.
-        * file_limit. Optional. Default is 10000. When listing a directory, the service will not report listings containing more than file_limit files and will instead respond with a 406 (Not Acceptable) status response.
-        * hash. Optional. Listing return values include a hash representing the state of the directory's contents. If you provide this argument to the metadata call, you give the service an opportunity to respond with a "304 Not Modified" status code instead of a full (potentially very large) directory listing. This argument is ignored if the specified path is associated with a file or if list=false.
-        * list. Optional. The strings true and false are valid values. true is the default. If true, this call returns a list of metadata representations for the contents of the directory. If false, this call returns the metadata for the directory itself.
-        * status_in_response. Optional. Some clients (e.g., Flash) cannot handle HTTP status codes well. If this parameter is set to true, the service will always return a 200 status and report the relevant status code via additional information in the response body. Default is false.
-        """ 
-
-        assert root in ["dropbox", "sandbox"]
-
-        path = "/metadata/%s%s" % (root, path)
+        path = "/metadata/%s%s" % (self.session.root, format_path(path))
 
         params = {'file_limit': file_limit,
-                  'list': "true" if list else "false",
-                  'status_in_response': status_in_response}
+                  'list': 'true',
+                  'include_deleted': include_deleted,
+                  }
+
+        if not list:
+            params['list'] = 'false'
         if hash is not None:
             params['hash'] = hash
+        if rev:
+            params['rev'] = rev
 
-        url, headers, params = self.request(self.api_host, "GET", path, params, callback)
+        url, params, headers = self.request(path, params, method='GET')
 
-        return self.api_rest.GET(url, headers)
+        return RESTClient.GET(url, headers)
 
-    def links(self, root, path):
-        assert root in ["dropbox", "sandbox"]
-        path = "/links/%s%s" % (root, path)
-        return self.build_full_url(self.api_host, path)
+    def thumbnail(self, from_path, size='large', format='JPEG'):
+        """Download a thumbnail for an image.
 
+        Unlike most other calls, thumbnail returns a raw HTTPResponse with the connection open.
+        You should call .read() and perform any processing you need, then close the HTTPResponse.
 
-    def build_url(self, url, params=None):
-        """Used internally to build the proper URL from parameters and the API_VERSION."""
-        if type(url) == unicode:
-            url = url.encode("utf8")
-        target_path = urllib2.quote(url)
+        Args:
+            from_path: The path to the file to be thumbnailed.
+            size: A string describing the desired thumbnail size.
+               At this time, 'small', 'medium', and 'large' are
+               officially supported sizes (32x32, 64x64, and 128x128
+               respectively), though others may be available. Check
+               https://www.dropbox.com/developers/docs#thumbnails for
+               more details.
 
-        if params:
-            return "/%d%s?%s" % (API_VERSION, target_path, urllib.urlencode(params))
-        else:
-            return "/%d%s" % (API_VERSION, target_path)
+        Returns:
+            An httplib.HTTPResponse that is the result of the request.
 
+        Raises:
+            A dropbox.rest.ErrorResponse with an HTTP status of
 
-    def build_full_url(self, host, target):
-        """Used internally to construct the complete URL to the service."""
-        port = "" if self.port == 80 else ":%d" % self.port
-        base_full_url = "http://%s%s" % (host, port)
-        return base_full_url + self.build_url(target)
+            - 400: Bad request (may be due to many things; check e.error for details)
+            - 404: No file was found at the given from_path, or files of that type cannot be thumbnailed.
+            - 415: Image is invalid and cannot be thumbnailed.
+        """
+        assert format in ['JPEG', 'PNG'], "expected a thumbnail format of 'JPEG' or 'PNG', got %s" % format
 
+        path = "/thumbnails/%s%s" % (self.session.root, format_path(from_path))
 
-    def account(self, email='', password='', first_name='', last_name='', source=None):
-        params = {'email': email, 'password': password,
-                  'first_name': first_name, 'last_name': last_name}
+        url, params, headers = self.request(path, {'size': size}, method='GET', content_server=True)
+        return RESTClient.request("GET", url, headers=headers, raw_response=True)  # TODO: raw_response
 
-        url, headers, params = self.request(self.api_host, "POST", "/account",
-                                            params, None)
+    def thumbnail_and_metadata(self, from_path, size='large', format='JPEG'):
+        """Download a thumbnail for an image alongwith its metadata.
 
-        return self.api_rest.POST(url, params, headers)
+        Acts as a thin wrapper around thumbnail() (see thumbnail() comments for
+        more details)
 
-    
-    def thumbnail(self, root, from_path, size='small'):
-        assert root in ["dropbox", "sandbox"]
-        assert size in ['small','medium','large']
-        
-        path = "/thumbnails/%s%s" % (root, from_path)
+        Args:
+            from_path: The path to the file to be thumbnailed.
+            size: A string describing the desired thumbnail size. See thumbnail()
+               for details.
 
-        url, headers, params = self.request(self.content_host, "GET", path,
-                                            {'size': size}, None)
-        return self.content_rest.request("GET", url, headers=headers, raw_response=True)
+        Returns:
+            - An httplib.HTTPResponse that is the result of the request.
+            - A dictionary containing the metadata of the file whose thumbnail
+              was downloaded (see https://www.dropbox.com/developers/docs#metadata
+              for details).
 
+        Raises:
+            A dropbox.rest.ErrorResponse with an HTTP status of
+
+            - 400: Bad request (may be due to many things; check e.error for details)
+            - 404: No file was found at the given from_path, or files of that type cannot be thumbnailed.
+            - 415: Image is invalid and cannot be thumbnailed.
+            - 200: Request was okay but response was malformed in some way.
+        """
+        thumbnail_res = self.thumbnail(from_path, size, format)
+        metadata = DropboxClient.__parse_metadata_as_dict(thumbnail_res)
+
+        return thumbnail_res, metadata
+
+    def search(self, path, query, file_limit=1000, include_deleted=False):
+        """Search directory for filenames matching query.
+
+        Args:
+            path: The directory to search within.
+
+            query: The query to search on (minimum 3 characters).
+
+            file_limit: The maximum number of file entries to return within a folder.
+               The server will return at max 1,000 files.
+
+            include_deleted: Whether to include deleted files in search results.
+
+        Returns:
+            A list of the metadata of all matching files (up to
+            file_limit entries).  For a detailed description of what
+            this call returns, visit:
+            https://www.dropbox.com/developers/docs#search
+
+        Raises:
+            A dropbox.rest.ErrorResponse with an HTTP status of
+            400: Bad request (may be due to many things; check e.error
+            for details)
+        """
+        path = "/search/%s%s" % (self.session.root, format_path(path))
+
+        params = {
+            'query': query,
+            'file_limit': file_limit,
+            'include_deleted': include_deleted,
+            }
+
+        url, params, headers = self.request(path, params)
+
+        return RESTClient.POST(url, params, headers)
+
+    def revisions(self, path, rev_limit=1000):
+        """Retrieve revisions of a file.
+
+        Args:
+            path: The file to fetch revisions for. Note that revisions
+                are not available for folders.
+            rev_limit: The maximum number of file entries to return within
+                a folder. The server will return at max 1,000 revisions.
+
+        Returns:
+            A list of the metadata of all matching files (up to rev_limit entries).
+
+            For a detailed description of what this call returns, visit:
+            https://www.dropbox.com/developers/docs#revisions
+
+        Raises:
+            A dropbox.rest.ErrorResponse with an HTTP status of
+
+            - 400: Bad request (may be due to many things; check e.error for details)
+            - 404: No revisions were found at the given path.
+        """
+        path = "/revisions/%s%s" % (self.session.root, format_path(path))
+
+        params = {
+            'rev_limit': rev_limit,
+            }
+
+        url, params, headers = self.request(path, params, method='GET')
+
+        return RESTClient.GET(url, headers)
+
+    def restore(self, path, rev):
+        """Restore a file to a previous revision.
+
+        Args:
+            path: The file to restore. Note that folders can't be restored.
+            rev: A previous rev value of the file to be restored to.
+
+        Returns:
+            A dictionary containing the metadata of the newly restored file.
+
+            For a detailed description of what this call returns, visit:
+            https://www.dropbox.com/developers/docs#restore
+
+        Raises:
+            A dropbox.rest.ErrorResponse with an HTTP status of
+
+            - 400: Bad request (may be due to many things; check e.error for details)
+            - 404: Unable to find the file at the given revision.
+        """
+        path = "/restore/%s%s" % (self.session.root, format_path(path))
+
+        params = {
+            'rev': rev,
+            }
+
+        url, params, headers = self.request(path, params)
+
+        return RESTClient.POST(url, params, headers)
+
+    def media(self, path):
+        """Get a temporary unauthenticated URL for a media file.
+
+        All of Dropbox's API methods require OAuth, which may cause problems in
+        situations where an application expects to be able to hit a URL multiple times
+        (for example, a media player seeking around a video file). This method
+        creates a time-limited URL that can be accessed without any authentication,
+        and returns that to you, along with an expiration time.
+
+        Args:
+            path: The file to return a URL for. Folders are not supported.
+
+        Returns:
+            A dictionary that looks like the following example:
+
+            ``{'url': 'https://dl.dropbox.com/0/view/wvxv1fw6on24qw7/file.mov', 'expires': 'Thu, 16 Sep 2011 01:01:25 +0000'}``
+
+            For a detailed description of what this call returns, visit:
+            https://www.dropbox.com/developers/docs#media
+
+        Raises:
+            A dropbox.rest.ErrorResponse with an HTTP status of
+
+            - 400: Bad request (may be due to many things; check e.error for details)
+            - 404: Unable to find the file at the given path.
+        """
+        path = "/media/%s%s" % (self.session.root, format_path(path))
+
+        url, params, headers = self.request(path, method='GET')
+
+        return RESTClient.GET(url, headers)
+
+    def share(self, path):
+        """Create a shareable link to a file or folder.
+
+        Shareable links created on Dropbox are time-limited, but don't require any
+        authentication, so they can be given out freely. The time limit should allow
+        at least a day of shareability, though users have the ability to disable
+        a link from their account if they like.
+
+        Args:
+            path: The file or folder to share.
+
+        Returns:
+            A dictionary that looks like the following example:
+
+            ``{'url': 'http://www.dropbox.com/s/m/a2mbDa2', 'expires': 'Thu, 16 Sep 2011 01:01:25 +0000'}``
+
+            For a detailed description of what this call returns, visit:
+            https://www.dropbox.com/developers/docs#share
+
+        Raises:
+            A dropbox.rest.ErrorResponse with an HTTP status of
+
+            - 400: Bad request (may be due to many things; check e.error for details)
+            - 404: Unable to find the file at the given path.
+        """
+        path = "/shares/%s%s" % (self.session.root, format_path(path))
+
+        url, params, headers = self.request(path, method='GET')
+
+        return RESTClient.GET(url, headers)
