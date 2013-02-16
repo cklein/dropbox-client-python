@@ -5,7 +5,10 @@ it's fairly self-explanatory.
 """
 
 import re
-import json
+try:
+    import json
+except ImportError:
+    import simplejson as json
 
 from dropbox.rest import ErrorResponse
 from dropbox.rest import RESTClient

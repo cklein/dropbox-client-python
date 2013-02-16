@@ -7,7 +7,10 @@ import httplib
 import os
 # import pkg_resources
 import re
-import json
+try:
+    import json
+except ImportError:
+    import simplejson as json
 import socket
 # import ssl
 import urllib
