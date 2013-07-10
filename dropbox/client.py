@@ -609,3 +609,80 @@ class DropboxClient(object):
         url, params, headers = self.request(path, method='GET')
 
         return RESTClient.GET(url, headers)
+
+    def chunked_upload(self, file_obj, upload_id=None, offset=0):
+        """
+        Upload large files to Dropbox in mulitple chunks.
+
+        Args:
+            file_obj: A file-like object to upload. If you would like, you can pass a string as file_obj.
+            upload_id: Upload-ID returned by chunked_upload
+            offset: File offset
+        Returns:
+            A dictionary containing the upload id and the expected offset for the next call.
+
+            For a detailed description of what this call returns, visit:
+            https://www.dropbox.com/developers/core/docs#chunked-upload
+
+        Raises:
+            A dropbox.rest.ErrorResponse with an HTTP status of
+               400: Bad request (may be due to many things; check e.error for details)
+               404 The upload_id does not exist or has expired.
+        """
+        path = "/chunked_upload"
+
+        params = {}
+        if upload_id is not None:
+            params['upload_id'] = upload_id
+            params['offset'] = offset
+
+        url, params, headers = self.request(path, params, method='PUT', content_server=True)
+        return RESTClient.PUT(url, file_obj.read(), headers)
+
+    def commit_chunked_upload(self, full_path, upload_id, overwrite=False, parent_rev=None):
+        """
+        Complete an upload initiated by the /chunked_upload method.
+
+        Args:
+            full_path: The full path to upload the file to, *including the file name*.
+                If the destination directory does not yet exist, it will be created.
+            upload_id: Upload id returned by chunked_upload
+            overwrite: Whether to overwrite an existing file at the given path. [default False]
+                If overwrite is False and a file already exists there, Dropbox
+                will rename the upload to make sure it doesn't overwrite anything.
+                You need to check the metadata returned for the new name.
+                This field should only be True if your intent is to potentially
+                clobber changes to a file that you don't know about.
+            parent_rev: The rev field from the 'parent' of this upload. [optional]
+                If your intent is to update the file at the given path, you should
+                pass the parent_rev parameter set to the rev value from the most recent
+                metadata you have of the existing file at that path. If the server
+                has a more recent version of the file at the specified path, it will
+                automatically rename your uploaded file, spinning off a conflict.
+                Using this parameter effectively causes the overwrite parameter to be ignored.
+                The file will always be overwritten if you send the most-recent parent_rev,
+                and it will never be overwritten if you send a less-recent one.
+
+        Returns:
+            A dictionary containing the metadata of the newly uploaded file.
+
+            For a detailed description of what this call returns, visit:
+            https://www.dropbox.com/developers/docs#files-put
+
+        Raises:
+            A dropbox.rest.ErrorResponse with an HTTP status of
+               400: Bad request (may be due to many things; check e.error for details)
+        """
+        path = '/commit_chunked_upload/%s%s' % (self.session.root, format_path(full_path))
+
+        params = {
+            'upload_id': upload_id,
+            'overwrite': bool(overwrite),
+            }
+
+        if parent_rev is not None:
+            params['parent_rev'] = parent_rev
+
+        url, params, headers = self.request(path, params, method='PUT', content_server=True)
+
+        return RESTClient.POST(url, headers)
