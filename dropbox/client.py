@@ -392,7 +392,9 @@ class DropboxClient(object):
     def path_exists(self, path):
         """Returns metadata if the path exists, None if it doesn't"""
         try:
-            return self.metadata(path)
+            metadata = self.metadata(path)
+            if metadata['is_deleted']:
+                return None
         except ErrorResponse, error:
             if error.status == 404:
                 return None
