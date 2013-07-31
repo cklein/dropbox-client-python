@@ -389,6 +389,15 @@ class DropboxClient(object):
 
         return RESTClient.GET(url, headers)
 
+    def path_exists(self, path):
+        """Returns metadata if the path exists, None if it doesn't"""
+        try:
+            return self.metadata(path)
+        except ErrorResponse, error:
+            if error.status == 404:
+                return None
+            raise
+
     def thumbnail(self, from_path, size='large', format='JPEG'):
         """Download a thumbnail for an image.
 
